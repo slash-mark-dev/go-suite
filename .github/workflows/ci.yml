@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, Go ${{ matrix.go }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        go: ['1.23.x', 'stable']
+        include:
+          - os: macos-latest
+            go: stable
+          - os: windows-latest
+            go: stable
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+      - name: gofmt
+        if: runner.os != 'Windows'
+        shell: bash
+        run: test -z "$(gofmt -l cmd internal)" || (gofmt -l cmd internal; exit 1)
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+      - name: build
+        run: go build -o sm-go${{ runner.os == 'Windows' && '.exe' || '' }} ./cmd/sm-go
+      - name: smoke test
+        shell: bash
+        run: ./sm-go help && ./sm-go help vuln > /dev/null
+
+  differential:
+    name: differential tests vs golang.org/x/mod and the go command
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - run: sh verify/setup.sh
+      - run: go test -count=1 ./...
+        working-directory: verify

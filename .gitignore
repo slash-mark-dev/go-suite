@@ -1,0 +1,4 @@
+/sm-go
+/dist/
+*.test
+.DS_Store
