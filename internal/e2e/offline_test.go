@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,7 +42,7 @@ func TestOfflineNoNetwork(t *testing.T) {
 	for _, mode := range []string{"--offline", "SMGO_OFFLINE=1"} {
 		for _, args := range runs {
 			// A fresh, empty module cache and sm-go cache for every run.
-			extra := []string{"GOMODCACHE=" + t.TempDir(), "SMGO_CACHE_DIR=" + t.TempDir()}
+			extra := []string{"GOMODCACHE=" + modCacheDir(t), "SMGO_CACHE_DIR=" + t.TempDir()}
 			full := append([]string{}, args...)
 			if mode == "--offline" {
 				full = append(full, "--offline")
@@ -64,7 +65,7 @@ func TestOfflineNoNetwork(t *testing.T) {
 	// GOPROXY=off alone the go command would still ask the checksum
 	// database about modules missing from go.sum (apidiff builds a
 	// throwaway module without go.sum).
-	mc := t.TempDir()
+	mc := modCacheDir(t)
 	if out, err := w.GoEnv(dir, []string{"GOMODCACHE=" + mc}, "mod", "download", "github.com/pub/util@v1.0.0", "github.com/pub/util@v1.1.0"); err != nil {
 		t.Fatalf("go mod download: %v\n%s", err, out)
 	}
@@ -83,7 +84,7 @@ func TestOfflineNoNetwork(t *testing.T) {
 
 	// Private modules: GOPROXY=off alone still lets the go command fetch
 	// GOPRIVATE modules directly from their hosts.
-	r = w.RunEnv(dir, []string{"GOPRIVATE=corp.example.com", "GOMODCACHE=" + t.TempDir(), "SMGO_CACHE_DIR=" + t.TempDir()},
+	r = w.RunEnv(dir, []string{"GOPRIVATE=corp.example.com", "GOMODCACHE=" + modCacheDir(t), "SMGO_CACHE_DIR=" + t.TempDir()},
 		"apidiff", "corp.example.com/lib@v1.0.0", "corp.example.com/lib@v1.1.0", "--offline")
 	if r.Code != 3 {
 		t.Errorf("apidiff of an uncached private module offline: exit %d, want 3\n%s\n%s", r.Code, r.Stdout, r.Stderr)
@@ -91,4 +92,24 @@ func TestOfflineNoNetwork(t *testing.T) {
 	if out := r.Stdout + r.Stderr; strings.Contains(out, "go-get=1") || strings.Contains(out, "https fetch") || strings.Contains(out, "git ") {
 		t.Errorf("the go command tried to fetch a private module directly:\n%s", out)
 	}
+}
+
+// modCacheDir returns a temporary GOMODCACHE. The go command makes module
+// cache files read-only, so t.TempDir's cleanup fails for non-root users
+// unless the tree is made writable first (cleanups run last-in first-out).
+func modCacheDir(t *testing.T) string {
+	dir := t.TempDir()
+	t.Cleanup(func() {
+		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+			if err == nil {
+				mode := os.FileMode(0o644)
+				if d.IsDir() {
+					mode = 0o755
+				}
+				os.Chmod(path, mode)
+			}
+			return nil
+		})
+	})
+	return dir
 }
