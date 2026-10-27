@@ -51,7 +51,8 @@ func Use() func() int {
 const appMain = `package main
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"os"
 
@@ -60,9 +61,10 @@ import (
 )
 
 func main() {
-	b, _ := json.Marshal(os.Args)
+	var b bytes.Buffer
+	_ = gob.NewEncoder(&b).Encode(os.Args)
 	get := big.Use()
-	fmt.Fprintln(os.Stdout, string(b), vulnmod.Bad(len(os.Args)), big.Table[len(os.Args)],
+	fmt.Fprintln(os.Stdout, b.Len(), vulnmod.Bad(len(os.Args)), big.Table[len(os.Args)],
 		big.Sum([]int{1}), big.Sum([]float64{2}), get())
 	if f, err := os.Open("x"); err == nil {
 		f.Close()
@@ -89,7 +91,10 @@ func addVulns(w *testenv.World) {
 	w.AddVuln(testenv.SimpleVuln("GO-2025-0001", "example.com/vulnmod", "0", "1.1.0", "example.com/vulnmod", []string{"Bad"}, "CVE-2025-0001"))
 	w.AddVuln(testenv.SimpleVuln("GO-2025-0002", "example.com/vulnmod", "0", "1.1.0", "example.com/vulnmod", []string{"Unused"}))
 	w.AddVuln(testenv.SimpleVuln("GO-2025-0003", "example.com/vulnmod", "0", "1.1.0", "example.com/vulnmod/other", []string{"Thing"}))
-	w.AddVuln(testenv.SimpleVuln("GO-2025-1000", vulndb.Stdlib, "0", "1.99.0", "encoding/json", []string{"Marshal"}))
+	// A standard library symbol the compiler can never inline (its body
+	// has a defer), so it has its own function table entry in every Go
+	// version. (encoding/json.Marshal is inlined by newer compilers.)
+	w.AddVuln(testenv.SimpleVuln("GO-2025-1000", vulndb.Stdlib, "0", "1.99.0", "encoding/gob", []string{"Encoder.EncodeValue"}))
 	w.AddVuln(testenv.SimpleVuln("GO-2025-1001", vulndb.Stdlib, "0", "1.99.0", "net/smtp", []string{"SendMail"}))
 	win := testenv.SimpleVuln("GO-2025-1002", vulndb.Stdlib, "0", "1.99.0", "os", nil)
 	win.Affected[0].EcosystemSpecific.Imports[0].GOOS = []string{"windows"}

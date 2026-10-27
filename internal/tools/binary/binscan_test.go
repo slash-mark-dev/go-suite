@@ -140,7 +140,7 @@ func TestBinscan(t *testing.T) {
 			"GO-2025-0001": "linked",   // vulnmod.Bad is called
 			"GO-2025-0002": "package",  // vulnmod.Unused is dead code
 			"GO-2025-0003": "module",   // vulnmod/other is not imported
-			"GO-2025-1000": "linked",   // encoding/json.Marshal
+			"GO-2025-1000": "linked",   // encoding/gob.(*Encoder).EncodeValue
 			"GO-2025-1001": "module",   // net/smtp is not linked
 			"GO-2025-1002": "platform", // windows-only
 		}

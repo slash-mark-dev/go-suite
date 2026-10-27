@@ -423,7 +423,7 @@ func checkRetractions(c *cli.Context, p *project.Project, res *ReleaseResult, ad
 func git(c *cli.Context, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(c.Ctx, "git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(c.Env.Environ(), "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
+	cmd.Env = append(c.Env.EnvironIn(dir), "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()

@@ -119,8 +119,15 @@ type GoChange struct {
 	GOTOOLCHAIN   string `json:"gotoolchain,omitempty"`
 	// Blocked is set when the local toolchain is too old and GOTOOLCHAIN
 	// does not allow switching: 'go get' fails.
-	Blocked bool   `json:"blocked"`
-	Switch  string `json:"switch,omitempty"` // toolchain the go command would switch to
+	Blocked bool `json:"blocked"`
+	// Switch is the toolchain the go command would download and switch to
+	// when the local one is too old ("" if the list of available
+	// toolchains could not be read); SwitchMin is the minimum it needs.
+	Switch    string `json:"switch,omitempty"`
+	SwitchMin string `json:"switchMin,omitempty"`
+	// ToolchainUnknown is set when the toolchain line depends on a switch
+	// target that could not be determined.
+	ToolchainUnknown bool `json:"toolchainUnknown,omitempty"`
 }
 
 // UpgradeResult is the JSON result of upgrade.
@@ -505,8 +512,10 @@ func localGoVersion(c *cli.Context) string {
 
 // goChange predicts how `go get` changes the go and toolchain lines: the
 // go line is raised to the highest go version required by the new build
-// list; when it is raised and the running toolchain is newer, the go
-// command records it in the toolchain line.
+// list; when it is raised, Go 1.21 to 1.24 also record a newer running
+// toolchain in the toolchain line (Go 1.25 and later do not). When the
+// local toolchain is too old, the go command switches to a newer one
+// first (GOTOOLCHAIN permitting) and that toolchain's rules apply.
 func goChange(c *cli.Context, p *project.Project, ng *modgraph.Graph) (GoChange, error) {
 	gc := GoChange{GOTOOLCHAIN: c.Env.Get("GOTOOLCHAIN"), LocalGo: localGoVersion(c)}
 	if gc.GOTOOLCHAIN == "" {
@@ -535,23 +544,19 @@ func goChange(c *cli.Context, p *project.Project, ng *modgraph.Graph) (GoChange,
 			gc.Blocked = true
 			return gc, nil
 		}
-		gc.Switch = "go" + maxGo
-		if isLang(maxGo) && modgraph.CompareGo(maxGo, "1.21") >= 0 {
-			gc.Switch += ".0"
+		gc.SwitchMin = "go" + maxGo
+		list, err := toolchainChoices(c.Ctx, mode, gc.LocalGo, c.Proxy().Versions, c.Env.Getenv("PATH"), c.Env.Getenv("PATHEXT"))
+		if err != nil {
+			c.Warnf("could not list Go toolchains to predict the switch target: %v", err)
 		}
-		gc.ToolchainTo = ""
+		gc.Switch = newerToolchain(maxGo, list)
+		if gc.Switch == "" {
+			gc.ToolchainUnknown = true
+		}
+		gc.ToolchainTo = predictToolchain(maxGo, gc.ToolchainFrom, strings.TrimPrefix(gc.Switch, "go"))
 		return gc, nil
 	}
-	local := gc.LocalGo
-	tc := strings.TrimPrefix(gc.ToolchainFrom, "go")
-	switch {
-	case local != "" && modgraph.CompareGo(local, maxGo) > 0 && modgraph.CompareGo(local, tc) > 0:
-		gc.ToolchainTo = "go" + local
-	case tc != "" && modgraph.CompareGo(tc, maxGo) > 0:
-		gc.ToolchainTo = gc.ToolchainFrom
-	default:
-		gc.ToolchainTo = ""
-	}
+	gc.ToolchainTo = predictToolchain(maxGo, gc.ToolchainFrom, gc.LocalGo)
 	return gc, nil
 }
 
@@ -711,12 +716,14 @@ func printUpgrade(c *cli.Context, res *UpgradeResult) {
 		out.Table([]string{"MODULE", "FROM", "TO", "CHANGE", "NOTES"}, rows)
 	}
 	gc := res.Go
-	if gc.To != gc.From || gc.ToolchainTo != gc.ToolchainFrom {
+	if gc.To != gc.From || gc.ToolchainTo != gc.ToolchainFrom || gc.ToolchainUnknown {
 		out.Heading("Go version")
 		if gc.To != gc.From {
 			out.Printf("  go %s → %s %s\n", gc.From, gc.To, out.Dim("(required by "+gc.RequiredBy+")"))
 		}
-		if gc.ToolchainTo != gc.ToolchainFrom {
+		if gc.ToolchainUnknown {
+			out.Printf("  toolchain line: depends on the toolchain the go command switches to\n")
+		} else if gc.ToolchainTo != gc.ToolchainFrom {
 			from, to := gc.ToolchainFrom, gc.ToolchainTo
 			if from == "" {
 				from = "none"
@@ -730,7 +737,9 @@ func printUpgrade(c *cli.Context, res *UpgradeResult) {
 		case gc.Blocked:
 			out.Bad("local Go %s is too old and GOTOOLCHAIN=%s forbids switching", gc.LocalGo, gc.GOTOOLCHAIN)
 		case gc.Switch != "":
-			out.Warn("local Go %s is too old: the go command will download and switch to %s (GOTOOLCHAIN=%s)", gc.LocalGo, gc.Switch, gc.GOTOOLCHAIN)
+			out.Warn("local Go %s is too old: the go command will switch to %s (needs %s or later; GOTOOLCHAIN=%s)", gc.LocalGo, gc.Switch, gc.SwitchMin, gc.GOTOOLCHAIN)
+		case gc.SwitchMin != "":
+			out.Warn("local Go %s is too old: the go command will switch to a newer toolchain (%s or later; GOTOOLCHAIN=%s)", gc.LocalGo, gc.SwitchMin, gc.GOTOOLCHAIN)
 		}
 	}
 	for _, mc := range res.Changes {

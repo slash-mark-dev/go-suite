@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -46,6 +47,9 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	smgo = filepath.Join(tmp, "sm-go")
+	if runtime.GOOS == "windows" {
+		smgo += ".exe"
+	}
 	out, err := exec.Command("go", "build", "-o", smgo, "github.com/slash-mark-dev/go-suite/cmd/sm-go").CombinedOutput()
 	if err != nil {
 		fmt.Printf("e2e: building sm-go: %v\n%s", err, out)

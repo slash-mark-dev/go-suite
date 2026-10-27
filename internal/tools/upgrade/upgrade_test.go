@@ -257,11 +257,29 @@ func TestUpgradeGoToolchainBlocked(t *testing.T) {
 	if _, _, out, err := realGet(t, w, []string{"example.com/dep@v1.2.0"}, reqs...); err == nil || !strings.Contains(out, "requires go >= 1.99") {
 		t.Fatalf("real go get should fail: %v\n%s", err, out)
 	}
-	// With GOTOOLCHAIN=auto the go command would switch toolchains.
+	// With GOTOOLCHAIN=auto the go command would switch toolchains. Without
+	// a list of published toolchains the target is unknown.
 	r = w.RunEnv(dir, []string{"GOTOOLCHAIN=auto"}, "upgrade", "example.com/dep@v1.2.0", "--no-api", "--no-vulns", "--json")
+	res = upgrade.UpgradeResult{}
 	r.Decode(t, &res)
-	if res.Go.Blocked || res.Go.Switch != "go1.99.0" {
+	if res.Go.Blocked || res.Go.Switch != "" || res.Go.SwitchMin != "go1.99" || !res.Go.ToolchainUnknown {
 		t.Fatalf("go = %+v", res.Go)
+	}
+	// With published toolchains, go get switches to the latest patch release
+	// of the newest family before the most recent one (go1.99.4, not
+	// go1.99.0 or go1.100.2); Go 1.25+ then writes no toolchain line.
+	for _, v := range []string{"v0.0.1-go1.99.0.linux-amd64", "v0.0.1-go1.99.4.linux-amd64", "v0.0.1-go1.99.4.darwin-arm64", "v0.0.1-go1.100rc1.linux-amd64", "v0.0.1-go1.100.2.linux-amd64"} {
+		w.AddModule("golang.org/toolchain", v, nil)
+	}
+	r = w.RunEnv(dir, []string{"GOTOOLCHAIN=auto"}, "upgrade", "example.com/dep@v1.2.0", "--no-api", "--no-vulns", "--no-cache", "--json")
+	res = upgrade.UpgradeResult{}
+	r.Decode(t, &res)
+	if res.Go.Blocked || res.Go.Switch != "go1.99.4" || res.Go.ToolchainUnknown || res.Go.ToolchainTo != "" {
+		t.Fatalf("go = %+v", res.Go)
+	}
+	r = w.RunEnv(dir, []string{"GOTOOLCHAIN=auto"}, "upgrade", "example.com/dep@v1.2.0", "--no-api", "--no-vulns")
+	if !strings.Contains(r.Stdout, "will switch to go1.99.4 (needs go1.99 or later") {
+		t.Errorf("text output:\n%s", r.Stdout)
 	}
 }
 

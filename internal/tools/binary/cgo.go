@@ -580,7 +580,7 @@ func verifyBuild(ctx context.Context, c *cli.Context, dir, tmp string, tr *targe
 	args = append(args, patterns...)
 	cmd := exec.CommandContext(ctx, c.Env.GoBin, args...)
 	cmd.Dir = dir
-	cmd.Env = append(c.Env.Environ(), "GOOS="+tr.GOOS, "GOARCH="+tr.GOARCH, "CGO_ENABLED=0")
+	cmd.Env = append(c.Env.EnvironIn(dir), "GOOS="+tr.GOOS, "GOARCH="+tr.GOARCH, "CGO_ENABLED=0")
 	output, err := cmd.CombinedOutput()
 	vr := &verifyResult{Command: fmt.Sprintf("GOOS=%s GOARCH=%s CGO_ENABLED=0 go %s", tr.GOOS, tr.GOARCH, strings.Join(args[:1], " ")+" "+strings.Join(patterns, " ")),
 		OK: err == nil, Output: strings.TrimSpace(firstLines(string(output), 20))}

@@ -33,7 +33,11 @@ jobs:
         shell: bash
         run: test -z "$(gofmt -l cmd internal)" || (gofmt -l cmd internal; exit 1)
       - run: go vet ./...
-      - run: go test -count=1 ./...
+      - name: go test
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -count=1 -json ./... 2>&1 | go run .github/ci/annotate.go
       - name: build
         run: go build -o sm-go${{ runner.os == 'Windows' && '.exe' || '' }} ./cmd/sm-go
       - name: smoke test
@@ -49,5 +53,8 @@ jobs:
         with:
           go-version: stable
       - run: sh verify/setup.sh
-      - run: go test -count=1 ./...
-        working-directory: verify
+      - name: go test (verify)
+        shell: bash
+        run: |
+          set -o pipefail
+          (cd verify && go test -count=1 -json ./... 2>&1) | go run .github/ci/annotate.go

@@ -3,16 +3,19 @@ package compliance
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/slash-mark-dev/go-suite/internal/cli"
 	"github.com/slash-mark-dev/go-suite/internal/httpx"
@@ -147,6 +150,12 @@ func (a *envAudit) get(k string) string {
 }
 
 func (a *envAudit) source(k string) string {
+	if since, ok := a.c.Env.Unsupported(k); ok {
+		if v, set := a.c.Env.Lookup(k); set && v != "" {
+			return "environment, ignored: needs Go " + since + " or later"
+		}
+		return "not supported by this Go version"
+	}
 	if v, ok := a.c.Env.Lookup(k); ok && v != "" {
 		return "environment"
 	}
@@ -598,17 +607,154 @@ func redactLogin(s string) string {
 }
 
 // gitConfig audits url.*.insteadOf rewrites and credential helpers in the
-// git configuration files the go command's git invocations read, found
-// the way git finds them (config.c: do_git_config_sequence).
+// git configuration the go command's git invocations read. git itself
+// lists it when installed (system file locations differ between git
+// builds: Homebrew, Xcode, Git for Windows); otherwise, or with git older
+// than 2.26, sm-go finds the files the way git does (config.c:
+// do_git_config_sequence). Without git the go command cannot fetch from
+// version control at all, so the configuration has no effect.
 func (a *envAudit) gitConfig() {
+	if listed, ok := a.gitListConfig(); ok {
+		parsed := map[string][]gitConfigEntry{} // file -> its entries, for line numbers
+		used := map[string]map[int]bool{}
+		for _, l := range listed {
+			if l.file != "" {
+				if _, seen := parsed[l.file]; !seen {
+					a.res.GitConfigs = append(a.res.GitConfigs, l.file)
+					parsed[l.file] = nil
+					if data, err := os.ReadFile(l.file); err == nil {
+						parsed[l.file] = parseGitConfig(data)
+					}
+					used[l.file] = map[int]bool{}
+				}
+				for i, e := range parsed[l.file] {
+					if !used[l.file][i] && e.section == l.entry.section && e.sub == l.entry.sub && e.key == l.entry.key &&
+						e.hasValue == l.entry.hasValue && e.value == l.entry.value {
+						used[l.file][i] = true
+						l.entry.line = e.line
+						break
+					}
+				}
+			}
+			a.auditGitEntry(l.origin, l.entry)
+		}
+		return
+	}
 	for _, f := range a.gitConfigFiles() {
 		data, err := os.ReadFile(f)
 		if err != nil {
 			continue
 		}
 		a.res.GitConfigs = append(a.res.GitConfigs, f)
-		a.auditGitFile(f, data)
+		for _, e := range parseGitConfig(data) {
+			a.auditGitEntry(f, e)
+		}
 	}
+}
+
+// gitListed is one configuration entry as git lists it.
+type gitListed struct {
+	file   string // absolute path of a file origin, "" otherwise
+	origin string // the file, or a description of a non-file origin
+	entry  gitConfigEntry
+}
+
+// gitEnvOrigin names configuration from GIT_CONFIG_COUNT/KEY_n/VALUE_n or
+// GIT_CONFIG_PARAMETERS, which git lists as "command line:".
+const gitEnvOrigin = "environment (GIT_CONFIG_*)"
+
+// gitListConfig runs `git config --list --show-origin --show-scope -z` in
+// the project directory, with the audited environment. ok is false when
+// git is not installed, older than 2.26, disabled with SMGO_NO_GIT=1, or
+// fails.
+func (a *envAudit) gitListConfig() ([]gitListed, bool) {
+	env := a.c.Env
+	if env.Getenv("SMGO_NO_GIT") == "1" {
+		return nil, false
+	}
+	git := env.LookPath("git")
+	if git == "" {
+		return nil, false
+	}
+	dir, err := filepath.Abs(a.c.Dir())
+	if err != nil {
+		return nil, false
+	}
+	run := func(args ...string) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(a.c.Ctx, 20*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, git, args...)
+		cmd.Dir = dir
+		cmd.Env = append(env.EnvironIn(dir), "GIT_TERMINAL_PROMPT=0")
+		return cmd.Output()
+	}
+	out, err := run("config", "--list", "--show-origin", "--show-scope", "-z")
+	if err != nil {
+		return nil, false
+	}
+	listed, relative, ok := parseGitList(out)
+	if !ok {
+		return nil, false
+	}
+	if relative {
+		// Repository files are listed relative to the top of the work tree
+		// (git changes to it), or to the git directory of a bare repository.
+		base := dir
+		if top, err := run("rev-parse", "--show-toplevel"); err == nil && len(bytes.TrimSpace(top)) > 0 {
+			base = filepath.FromSlash(string(bytes.TrimSpace(top)))
+		} else if gd, err := run("rev-parse", "--absolute-git-dir"); err == nil && len(bytes.TrimSpace(gd)) > 0 {
+			base = filepath.FromSlash(string(bytes.TrimSpace(gd)))
+		}
+		for i := range listed {
+			if f := listed[i].file; f != "" && !filepath.IsAbs(f) {
+				listed[i].file = filepath.Join(base, f)
+				listed[i].origin = listed[i].file
+			}
+		}
+	}
+	return listed, true
+}
+
+// parseGitList parses `git config --list --show-origin --show-scope -z`:
+// NUL-terminated scope, origin ("file:<path>", "command line:", "blob:<id>",
+// "standard input:") and "<key>\n<value>" (or a bare "<key>") fields.
+// Keys are section[.subsection].name with the section and name in lower
+// case. relative reports file origins that are not absolute paths.
+func parseGitList(out []byte) (listed []gitListed, relative, ok bool) {
+	fields := strings.Split(string(out), "\x00")
+	if len(fields) > 0 && fields[len(fields)-1] == "" {
+		fields = fields[:len(fields)-1]
+	}
+	if len(fields)%3 != 0 {
+		return nil, false, false
+	}
+	for i := 0; i < len(fields); i += 3 {
+		origin, kv := fields[i+1], fields[i+2]
+		var l gitListed
+		switch {
+		case strings.HasPrefix(origin, "file:"):
+			l.file = filepath.FromSlash(strings.TrimPrefix(origin, "file:"))
+			l.origin = l.file
+			if !filepath.IsAbs(l.file) {
+				relative = true
+			}
+		case strings.HasPrefix(origin, "command line:"):
+			l.origin = gitEnvOrigin
+		default:
+			l.origin = strings.TrimSuffix(origin, ":")
+		}
+		key, value, hasValue := strings.Cut(kv, "\n")
+		first, last := strings.Index(key, "."), strings.LastIndex(key, ".")
+		if first <= 0 || last == len(key)-1 {
+			continue
+		}
+		l.entry = gitConfigEntry{section: key[:first], key: key[last+1:], value: value, hasValue: hasValue}
+		if last > first {
+			l.entry.sub = key[first+1 : last]
+		}
+		listed = append(listed, l)
+	}
+	return listed, relative, true
 }
 
 // gitConfigFiles lists the system, XDG, global, repository and worktree
@@ -630,10 +776,10 @@ func (a *envAudit) gitConfigFiles() []string {
 	} else {
 		if xdg := env.Getenv("XDG_CONFIG_HOME"); xdg != "" {
 			files = append(files, filepath.Join(xdg, "git", "config"))
-		} else if h := env.Getenv("HOME"); h != "" {
+		} else if h := env.GitHome(); h != "" {
 			files = append(files, filepath.Join(h, ".config", "git", "config"))
 		}
-		if h := env.Home(); h != "" {
+		if h := env.GitHome(); h != "" {
 			files = append(files, filepath.Join(h, ".gitconfig"))
 		}
 	}
@@ -731,15 +877,15 @@ func isGitDir(dir string) bool {
 	return true
 }
 
-func (a *envAudit) auditGitFile(file string, data []byte) {
-	for _, e := range parseGitConfig(data) {
-		switch {
-		case e.section == "url" && e.key == "insteadof" && e.hasValue:
-			a.auditRewrite(file, e.line, e.sub, e.value)
-		case e.section == "credential" && e.key == "helper" && strings.HasPrefix(e.value, "store"):
-			a.addAt(report.Low, "git-credential-store", file, e.line, "git credential.helper=store keeps passwords in plaintext",
-				"credentials are written unencrypted to ~/.git-credentials", "use a system keychain helper (osxkeychain, manager, libsecret)")
-		}
+// auditGitEntry audits one git configuration entry from file (a path, or
+// a description of another origin).
+func (a *envAudit) auditGitEntry(file string, e gitConfigEntry) {
+	switch {
+	case e.section == "url" && e.key == "insteadof" && e.hasValue:
+		a.auditRewrite(file, e.line, e.sub, e.value)
+	case e.section == "credential" && e.key == "helper" && strings.HasPrefix(e.value, "store"):
+		a.addAt(report.Low, "git-credential-store", file, e.line, "git credential.helper=store keeps passwords in plaintext",
+			"credentials are written unencrypted to ~/.git-credentials", "use a system keychain helper (osxkeychain, manager, libsecret)")
 	}
 }
 

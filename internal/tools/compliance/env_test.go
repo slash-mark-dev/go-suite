@@ -289,7 +289,10 @@ func goRejectsProxy(t *testing.T, w *testenv.World, proxy string) bool {
 	case strings.Contains(out, "invalid proxy URL"), strings.Contains(out, "invalid file:// proxy URL"), strings.Contains(out, `parse \"`):
 		return true
 	case strings.Contains(out, "connection refused"), strings.Contains(out, "no such file"), strings.Contains(out, "HTTP response to HTTPS client"),
-		strings.Contains(out, "server gave HTTP response"), strings.Contains(out, "module lookup disabled"):
+		strings.Contains(out, "server gave HTTP response"), strings.Contains(out, "module lookup disabled"),
+		// Windows wording of connection refused and file not found.
+		strings.Contains(out, "actively refused"), strings.Contains(out, "cannot find the path specified"),
+		strings.Contains(out, "cannot find the file specified"):
 		return false
 	}
 	t.Fatalf("GOPROXY=%q: unexpected go output\n%s", proxy, out)
@@ -504,9 +507,17 @@ func TestEnvGOFLAGSToolchainGOVCS(t *testing.T) {
 	}
 }
 
+// netrcName is the file the go command reads in the home directory.
+func netrcName() string {
+	if runtime.GOOS == "windows" {
+		return "_netrc"
+	}
+	return ".netrc"
+}
+
 func TestEnvNetrc(t *testing.T) {
 	w, dir := envWorld(t)
-	netrc := filepath.Join(w.Home, ".netrc")
+	netrc := filepath.Join(w.Home, netrcName())
 	write := func(content string, mode os.FileMode) {
 		t.Helper()
 		if err := os.WriteFile(netrc, []byte(content), mode); err != nil {
@@ -533,7 +544,8 @@ default login anonymous password default-secret
 	if got, want := envRules(res), rules("netrc-plaintext:medium", "netrc-plaintext:medium", "netrc-default:high"); !reflect.DeepEqual(got, want) {
 		t.Errorf("rules %v, want %v", got, want)
 	}
-	if res.Netrc == nil || res.Netrc.Path != netrc || res.Netrc.Mode != "0600" {
+	// Windows has no Unix permission bits.
+	if res.Netrc == nil || res.Netrc.Path != netrc || runtime.GOOS != "windows" && res.Netrc.Mode != "0600" {
 		t.Fatalf("netrc %+v", res.Netrc)
 	}
 	wantMachines := []NetrcMachine{
@@ -663,7 +675,7 @@ func TestEnvNetrcMatchesGo(t *testing.T) {
 	}
 
 	// The finding says who actually uses default entries.
-	os.WriteFile(filepath.Join(w.Home, ".netrc"), []byte("default login u password p\n"), 0o600)
+	os.WriteFile(filepath.Join(w.Home, netrcName()), []byte("default login u password p\n"), 0o600)
 	_, res := runEnvJSON(t, w, dir, nil)
 	if len(res.Findings) != 1 || strings.Contains(res.Findings[0].Detail, "the go command and git send") {
 		t.Errorf("default finding %+v", res.Findings)
@@ -697,13 +709,22 @@ func TestEnvGitConfig(t *testing.T) {
 	w, dir := envWorld(t)
 	testenv.WriteFiles(t, w.Home, map[string]string{".gitconfig": gitconfigFindings})
 	gc := filepath.Join(w.Home, ".gitconfig")
-	r, res := runEnvJSON(t, w, dir, nil)
+	for _, m := range gitModes {
+		t.Run(m.name, func(t *testing.T) { testEnvGitConfig(t, w, dir, gc, m.extra) })
+	}
+	noSecrets(t, w, dir, nil, "glpat-SECRETTOKEN", "oauth2", "ghp_abcdefghijklmnopqrstuvwxyz0123")
+	r := w.RunEnv(dir, envClean(), "env")
+	mustContain(t, "text output", r.Stdout, "git insteadOf rewrites", "https://golang.org/ → http://mirror.corp.example/")
+}
+
+func testEnvGitConfig(t *testing.T, w *testenv.World, dir, gc string, extra []string) {
+	r, res := runEnvJSON(t, w, dir, extra)
 	if r.Code != 1 {
 		t.Errorf("exit %d", r.Code)
 	}
 	got := map[string][]string{}
 	for _, f := range res.Findings {
-		if f.File != gc {
+		if canonPath(f.File) != canonPath(gc) {
 			t.Errorf("finding file %s", f.File)
 		}
 		k := fmt.Sprint(f.Line)
@@ -725,13 +746,13 @@ func TestEnvGitConfig(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("findings by line:\n%v\nwant\n%v", got, want)
 	}
-	if !reflect.DeepEqual(res.GitConfigs, []string{gc}) {
+	if len(res.GitConfigs) != 1 || canonPath(res.GitConfigs[0]) != canonPath(gc) {
 		t.Errorf("gitConfigs %v", res.GitConfigs)
 	}
 	if len(res.GitRewrites) != 8 {
 		t.Fatalf("rewrites %+v", res.GitRewrites)
 	}
-	if r := res.GitRewrites[0]; r.From != "https://gitlab.corp.example/" || r.To != "https://***@gitlab.corp.example/" || r.Line != 3 || r.File != gc {
+	if r := res.GitRewrites[0]; r.From != "https://gitlab.corp.example/" || r.To != "https://***@gitlab.corp.example/" || r.Line != 3 || canonPath(r.File) != canonPath(gc) {
 		t.Errorf("rewrite 0 %+v", r)
 	}
 	for _, f := range res.Findings {
@@ -739,39 +760,51 @@ func TestEnvGitConfig(t *testing.T) {
 			t.Errorf("host finding %+v", f)
 		}
 	}
-	noSecrets(t, w, dir, nil, "glpat-SECRETTOKEN", "oauth2", "ghp_abcdefghijklmnopqrstuvwxyz0123")
-	r = w.RunEnv(dir, envClean(), "env")
-	mustContain(t, "text output", r.Stdout, "git insteadOf rewrites", "https://golang.org/ → http://mirror.corp.example/")
 }
 
 // gitOrigins asks git which files define url.*.insteadOf in dir with the
-// given environment: file -> "value <- base" entries.
+// given environment: canonical file -> "value <- base" entries. -z keeps
+// git from quoting paths (it quotes Windows paths with backslashes).
 func gitOrigins(t *testing.T, w *testenv.World, dir string, extra []string) map[string][]string {
 	t.Helper()
-	cmd := exec.Command("git", "config", "--show-origin", "--get-regexp", `^url\..*\.insteadof$`)
+	cmd := exec.Command("git", "config", "-z", "--show-origin", "--get-regexp", `^url\..*\.insteadof$`)
 	cmd.Dir = dir
 	cmd.Env = w.Env(envClean(extra...)...)
 	out, err := cmd.Output()
 	if err != nil && len(out) != 0 {
 		t.Fatalf("git config: %v\n%s", err, out)
 	}
+	fields := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
 	m := map[string][]string{}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" {
-			continue
-		}
-		origin, rest, _ := strings.Cut(line, "\t")
-		key, val, _ := strings.Cut(rest, " ")
+	for i := 0; i+1 < len(fields); i += 2 {
+		origin, kv := fields[i], fields[i+1]
+		key, val, _ := strings.Cut(kv, "\n")
 		base := strings.TrimSuffix(strings.TrimPrefix(key, "url."), ".insteadof")
-		f := strings.TrimPrefix(origin, "file:")
-		if !filepath.IsAbs(f) {
+		f := filepath.FromSlash(strings.TrimPrefix(origin, "file:"))
+		if strings.HasPrefix(origin, "command line:") {
+			f = gitEnvOrigin
+		} else if !filepath.IsAbs(f) {
 			// git reports repository files relative to the directory it
 			// changed into: the top of the working tree.
 			f = filepath.Join(gitTop(t, w, dir, extra), f)
 		}
+		f = canonPath(f)
 		m[f] = append(m[f], val+" <- "+base)
 	}
 	return m
+}
+
+// canonPath resolves symbolic links (macOS's /var is /private/var) and, on
+// Windows, short 8.3 names and slash direction, so that paths printed by
+// git and by sm-go compare equal.
+func canonPath(p string) string {
+	if !filepath.IsAbs(p) {
+		return p
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return filepath.Clean(p)
 }
 
 func gitTop(t *testing.T, w *testenv.World, dir string, extra []string) string {
@@ -783,7 +816,7 @@ func gitTop(t *testing.T, w *testenv.World, dir string, extra []string) string {
 	if err != nil {
 		t.Fatalf("git rev-parse --show-toplevel in %s: %v", dir, err)
 	}
-	return strings.TrimSpace(string(out))
+	return filepath.FromSlash(strings.TrimSpace(string(out)))
 }
 
 func gitRun(t *testing.T, w *testenv.World, dir string, args ...string) {
@@ -799,10 +832,19 @@ func gitRun(t *testing.T, w *testenv.World, dir string, args ...string) {
 func smgoOrigins(res *EnvResult) map[string][]string {
 	m := map[string][]string{}
 	for _, r := range res.GitRewrites {
-		m[r.File] = append(m[r.File], r.From+" <- "+r.To)
+		f := canonPath(r.File)
+		m[f] = append(m[f], r.From+" <- "+r.To)
 	}
 	return m
 }
+
+// gitModes runs a git configuration test with sm-go asking git (the
+// default when git is installed) and with its own model of git's lookup
+// (SMGO_NO_GIT=1, used with git older than 2.26).
+var gitModes = []struct {
+	name  string
+	extra []string
+}{{"git", nil}, {"model", []string{"SMGO_NO_GIT=1"}}}
 
 func requireGit(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
@@ -854,10 +896,12 @@ func TestEnvGitConfigFilesMatchGit(t *testing.T) {
 		{"GIT_DIR", t.TempDir(), []string{"GIT_DIR=" + filepath.Join(repo, ".git")}},
 		{"linked worktree", wt, nil},
 	} {
-		_, res := runEnvJSON(t, w, tt.dir, tt.extra)
-		got, want := smgoOrigins(res), gitOrigins(t, w, tt.dir, tt.extra)
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("%s:\nsm-go %v\ngit   %v", tt.name, got, want)
+		want := gitOrigins(t, w, tt.dir, tt.extra)
+		for _, m := range gitModes {
+			_, res := runEnvJSON(t, w, tt.dir, append(append([]string{}, tt.extra...), m.extra...))
+			if got := smgoOrigins(res); !reflect.DeepEqual(got, want) {
+				t.Errorf("%s (%s):\nsm-go %v\ngit   %v", tt.name, m.name, got, want)
+			}
 		}
 	}
 
@@ -865,10 +909,44 @@ func TestEnvGitConfigFilesMatchGit(t *testing.T) {
 	gitRun(t, w, repo, "config", "extensions.worktreeConfig", "true")
 	gitRun(t, w, wt, "config", "--worktree", "url.https://mirror-wt.example/.insteadOf", "https://wt.example/")
 	for _, d := range []string{wt, repo} {
-		_, res := runEnvJSON(t, w, d, nil)
-		if got, want := smgoOrigins(res), gitOrigins(t, w, d, nil); !reflect.DeepEqual(got, want) {
-			t.Errorf("worktreeConfig in %s:\nsm-go %v\ngit   %v", d, got, want)
+		want := gitOrigins(t, w, d, nil)
+		for _, m := range gitModes {
+			_, res := runEnvJSON(t, w, d, m.extra)
+			if got := smgoOrigins(res); !reflect.DeepEqual(got, want) {
+				t.Errorf("worktreeConfig in %s (%s):\nsm-go %v\ngit   %v", d, m.name, got, want)
+			}
 		}
+	}
+
+	// Configuration from the environment exists only for git itself.
+	extra := []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=url.https://mirror-env.example/.insteadOf", "GIT_CONFIG_VALUE_0=https://env.example/"}
+	_, res := runEnvJSON(t, w, repo, extra)
+	if got, want := smgoOrigins(res), gitOrigins(t, w, repo, extra); !reflect.DeepEqual(got, want) || len(got[gitEnvOrigin]) != 1 {
+		t.Errorf("GIT_CONFIG_COUNT:\nsm-go %v\ngit   %v", got, want)
+	}
+}
+
+func TestParseGitList(t *testing.T) {
+	abs := filepath.Join(t.TempDir(), "my dir", "config")
+	out := "global\x00file:" + filepath.ToSlash(abs) + "\x00url.https://Mirror.example/a.b/.insteadof\nhttps://x.example/\x00" +
+		"local\x00file:.git/config\x00core.bare\x00" +
+		"command\x00command line:\x00credential.helper\nstore\x00" +
+		"local\x00file:.git/config\x00user.name\n\x00"
+	got, relative, ok := parseGitList([]byte(out))
+	if !ok || !relative || len(got) != 4 {
+		t.Fatalf("parseGitList = %+v, %v, %v", got, relative, ok)
+	}
+	want := []gitListed{
+		{abs, abs, gitConfigEntry{section: "url", sub: "https://Mirror.example/a.b/", key: "insteadof", value: "https://x.example/", hasValue: true}},
+		{filepath.FromSlash(".git/config"), filepath.FromSlash(".git/config"), gitConfigEntry{section: "core", key: "bare"}},
+		{"", gitEnvOrigin, gitConfigEntry{section: "credential", key: "helper", value: "store", hasValue: true}},
+		{filepath.FromSlash(".git/config"), filepath.FromSlash(".git/config"), gitConfigEntry{section: "user", key: "name", hasValue: true}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("parseGitList:\n got %+v\nwant %+v", got, want)
+	}
+	if _, _, ok := parseGitList([]byte("local\x00file:x\x00")); ok {
+		t.Error("truncated output accepted")
 	}
 }
 
@@ -889,7 +967,6 @@ func TestEnvGitConfigValuesMatchGit(t *testing.T) {
 	; insteadOf = https://commented2.example/
 	insteadOf = https://gitlab.com/
 `})
-	_, res := runEnvJSON(t, w, dir, nil)
 	want := map[string][]string{}
 	for f, vs := range gitOrigins(t, w, dir, nil) {
 		for _, v := range vs {
@@ -897,8 +974,11 @@ func TestEnvGitConfigValuesMatchGit(t *testing.T) {
 			want[f] = append(want[f], redactURL(val)+" <- "+redactURL(base))
 		}
 	}
-	if got := smgoOrigins(res); !reflect.DeepEqual(got, want) {
-		t.Errorf("rewrites:\nsm-go %q\ngit   %q", got, want)
+	for _, m := range gitModes {
+		_, res := runEnvJSON(t, w, dir, m.extra)
+		if got := smgoOrigins(res); !reflect.DeepEqual(got, want) {
+			t.Errorf("rewrites (%s):\nsm-go %q\ngit   %q", m.name, got, want)
+		}
 	}
 }
 

@@ -269,6 +269,7 @@ func (w *World) Env(extra ...string) []string {
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + w.Home,
+		"USERPROFILE=" + w.Home, // the home directory on Windows
 		"GOPATH=" + w.GoPath,
 		"GOMODCACHE=" + w.ModCache,
 		"GOCACHE=" + goCache(),

@@ -160,7 +160,7 @@ func GoList(ctx context.Context, cfg Config, extra ...string) ([]*Package, error
 	args = append(args, pats...)
 	cmd := exec.CommandContext(ctx, cfg.Env.GoBin, args...)
 	cmd.Dir = cfg.Dir
-	env := cfg.Env.Environ()
+	env := cfg.Env.EnvironIn(cfg.Dir)
 	if cfg.GOOS != "" {
 		env = append(env, "GOOS="+cfg.GOOS)
 	}

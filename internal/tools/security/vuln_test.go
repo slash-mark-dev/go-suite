@@ -1,6 +1,8 @@
 package security_test
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -338,4 +340,23 @@ func TestVulnClean(t *testing.T) {
 	r = w.Run(dir, "vuln")
 	expectCode(t, r, 0)
 	contains(t, r.Stdout, "none")
+}
+
+// Positions stay relative to the project when it is reached through a
+// symbolic link (on macOS the temporary directory /var/... is
+// /private/var/...): the go command must see the same working directory.
+func TestVulnSymlinkedProject(t *testing.T) {
+	w, dir := vulnWorld(t)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	r := w.Run(link, "vuln", "--json")
+	expectCode(t, r, 1)
+	var res vulnJSON
+	r.Decode(t, &res)
+	v1 := res.Vulns[res.byID(t, "GO-2025-0001")]
+	if len(v1.CallPath) != 3 || v1.CallPath[1].Pos != "main.go:12" || v1.CallPath[2].Pos != "main.go:15" {
+		t.Errorf("call path through %s = %+v", link, v1.CallPath)
+	}
 }
